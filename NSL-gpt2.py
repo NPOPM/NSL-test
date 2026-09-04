@@ -4,6 +4,9 @@ import time
 import math
 torch.set_printoptions(8)
 
+GELU_PARA1 = math.sqrt(2.0 / math.pi)
+GELU_PARA2 = 0.044715
+
 def gelu(x):
     """
         Task: Use the torch API to implement the approximate calculation formula of the `GELU`
@@ -15,7 +18,8 @@ def gelu(x):
         Input: Tensor
         Output: Tensor
     """
-    pass
+    y = 0.5 * x * (1 + torch.tanh(GELU_PARA1 * (x + GELU_PARA2 * x ** 3)))
+    return y
 
 
 def softmax(x):
