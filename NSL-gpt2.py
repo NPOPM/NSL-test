@@ -8,6 +8,8 @@ torch.set_printoptions(8)
 GELU_PARA1 = math.sqrt(2.0 / math.pi)
 GELU_PARA2 = 0.044715
 
+kv_cache = {}
+
 
 def gelu(x):
     '''
@@ -75,7 +77,7 @@ def ffn(x, mlp):  # [n_seq, n_embd] -> [n_seq, n_embd]
     return y
 
 
-def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] -> [n_q, d_v]
+def attention(q, k, v, mask, layer_index):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] -> [n_q, d_v]
     """
         mha:
             Q = q @ I
@@ -92,6 +94,7 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
         5.加权求和
             O = A' @ V
     """
+
     # 1
     A = q @ k.transpose(-2, -1)
     # 2
@@ -107,34 +110,51 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
     return O
 
 
-def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def mha(x, attn, n_head, layer_index):  # [n_seq, n_embd] -> [n_seq, n_embd]
+    global kv_cache
 
     c_attn, c_proj = attn['c_attn'], attn['c_proj']
     # qkv projection
     x = linear(x, c_attn)  # [n_seq, n_embd] -> [n_seq, 3*n_embd]
 
     # 拆分qkv
-    qkv = torch.chunk(x, 3, dim=-1)
+    q, k, v = torch.chunk(x, 3, dim=-1)  # [n_seq, n_embd]
 
-    # Split into heads
-    qkv_heads = [qkv_part.chunk(n_head, dim=-1) for qkv_part in
-                 qkv]  # 3 * [n_seq, n_embd] -> 3 * n_head * [n_seq, n_embd/n_head]
-    qkv_heads = list(zip(*qkv_heads))  # [3, n_head, n_seq, n_embd/n_head]
-
-    # 构造上三角矩阵causal_mask
-    """
-            | 0  -inf -inf ... -inf |
-            | 0    0  -inf ... -inf |
-            | 0    0    0  ... -inf |
-            |...  ...  ... ...  ... |
-            | 0    0    0  ...   0  |
-    """
+    # 构造矩阵causal_mask
     n_seq = x.size(0)
-    # 生成一个主对角线及以下为False，以上为True的三角矩阵
-    causal_mask = torch.triu(torch.ones(n_seq, n_seq), diagonal=1).bool()
+    # 如果有缓存
+    if layer_index in kv_cache:
+        k_cache, v_cache = kv_cache[layer_index]
+        n_new = k_cache.size(0) + n_seq
 
-    # Perform attention over each head
-    out_heads = [attention(q, k, v, causal_mask) for q, k, v in qkv_heads]  # n_head * [n_seq, n_embd/n_head]
+        causal_mask = torch.zeros(n_seq, n_new, dtype=torch.bool)  # [n_seq, n_new]
+        for i in range(n_seq):
+            causal_mask[i, k_cache.size(0) + i + 1:] = True
+    # 如果没有缓存
+    else:
+        # 生成一个主对角线及以下为False，以上为True的三角矩阵
+        causal_mask = torch.triu(torch.ones(n_seq, n_seq), diagonal=1).bool()
+
+    # 将新词拼接到kv
+    if layer_index in kv_cache:
+        k_cache, v_cache = kv_cache[layer_index]
+        k = torch.cat([k_cache, k], dim=0)  # [n_seq + 1, n_embd]
+        v = torch.cat([v_cache, v], dim=0)  # [n_seq + 1, n_embd]
+
+    # 更新kv_cache
+    kv_cache[layer_index] = (k, v)
+
+    # 拆头
+    q_heads = q.chunk(n_head, dim=-1)
+    k_heads = k.chunk(n_head, dim=-1)
+    v_heads = v.chunk(n_head, dim=-1)
+    qkv_heads = list(zip(q_heads, k_heads, v_heads))
+
+    # 在每个头上执行attention
+    out_heads = []
+    for q, k, v in qkv_heads:
+        out = attention(q, k, v, causal_mask, layer_index)
+        out_heads.append(out)  # n_head * [n_seq, n_embd/n_head]
 
     # 合并多头
     x = torch.cat(out_heads, dim=-1)
@@ -145,11 +165,11 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     return x
 
 
-def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def transformer_block(x, block, n_head, layer_index):  # [n_seq, n_embd] -> [n_seq, n_embd]
     mlp, attn, ln_1, ln_2 = block['mlp'], block['attn'], block['ln_1'], block['ln_2']
 
     # multi-head causal self attention
-    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head, layer_index=layer_index)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
     # position-wise feed forward network
     x = x + ffn(layer_norm(x, ln_2), mlp)  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -158,14 +178,29 @@ def transformer_block(x, block, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
 
 
 def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
+    global kv_cache
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
-    # token + positional embeddings
-    x = wte[inputs] + wpe[range(len(inputs))]  # [n_seq] -> [n_seq, n_embd]
 
+    # 计算位置编码
+    if kv_cache:
+        # 如果有缓存，就从缓存长度开始
+        k_cache, v_cache = kv_cache[0]
+        start_pos = k_cache.size(0)
+    else:
+        # 如果没有缓存，就从0开始
+        start_pos = 0
+
+    positions = list(range(start_pos, start_pos + len(inputs)))
+
+    # token + positional embeddings
+    x = wte[inputs] + wpe[positions]  # [n_seq] -> [n_seq, n_embd]
     x = torch.Tensor(x)
+
     # forward pass through n_layer transformer blocks
+    layer_index = 0
     for block in blocks:
-        x = transformer_block(x, block, n_head=n_head)  # [n_seq, n_embd] -> [n_seq, n_embd]
+        x = transformer_block(x, block, n_head=n_head, layer_index=layer_index)  # [n_seq, n_embd] -> [n_seq, n_embd]
+        layer_index += 1
 
     # projection to vocab
     x = layer_norm(x, ln_f)  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -173,14 +208,23 @@ def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
 
 
 def generate(inputs, params, n_head, n_tokens_to_generate):
+    global kv_cache
     from tqdm import tqdm
 
-    for _ in tqdm(range(n_tokens_to_generate), "generating"):  # auto-regressive decode loop
-        logits = gpt2(inputs, params, n_head=n_head)  # model forward pass
-        next_id = np.argmax(logits[-1])  # greedy sampling
-        inputs.append(int(next_id))  # append prediction to input
+    # 清空缓存
+    kv_cache = {}
 
-    return inputs[len(inputs) - n_tokens_to_generate:]  # only return generated ids
+    # 传入完整的prompt，填充缓存
+    logits = gpt2(inputs, params, n_head=n_head)
+    next_id = np.argmax(logits[-1])
+    inputs.append(int(next_id))
+
+    for _ in tqdm(range(n_tokens_to_generate - 1), "generating", total=n_tokens_to_generate):
+        logits = gpt2([next_id], params, n_head=n_head)  # 这里只传1个token
+        next_id = np.argmax(logits[-1])
+        inputs.append(int(next_id))
+
+    return inputs[len(inputs) - n_tokens_to_generate:]
 
 
 def greedy_speculative_generate(inputs, draft_params, target_params, hparams_draft, hparams_target,
