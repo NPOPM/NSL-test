@@ -97,8 +97,8 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
     # 2
     d_k = q.size(-1)
     A = A / math.sqrt(d_k)
-    # 3 将掩码矩阵为-inf的位置赋值为一个非常大的负数
-    A = A.masked_fill(mask == float('-inf'), -1e9)
+    # 3 将掩码矩阵为True的位置赋值为一个非常大的负数
+    A = A.masked_fill(mask, -1e9)
     # 4
     A_ = softmax(A, dim=-1)
     # 5
@@ -132,7 +132,6 @@ def mha(x, attn, n_head):  # [n_seq, n_embd] -> [n_seq, n_embd]
     n_seq = x.size(0)
     # 生成一个主对角线及以下为False，以上为True的三角矩阵
     causal_mask = torch.triu(torch.ones(n_seq, n_seq), diagonal=1).bool()
-    causal_mask = causal_mask.masked_fill(causal_mask, float('-inf'))
 
     # Perform attention over each head
     out_heads = [attention(q, k, v, causal_mask) for q, k, v in qkv_heads]  # n_head * [n_seq, n_embd/n_head]
@@ -188,7 +187,7 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
                                 n_tokens_to_generate, K):
     """
         Task: Load 124M and 1558M models at the same time, use greedy sampling, and complete speculative decoding
-    
+
         Inputs:
             inputs (list): The initial list of token IDs from the prompt.
             draft_params, target_params: Model weights for the draft and target models.
@@ -198,7 +197,7 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
 
         Returns:
             list: A list of newly generated token IDs.
-            
+
     """
     generated_ids = []
     current_inputs = list(inputs)
