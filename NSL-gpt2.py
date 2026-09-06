@@ -77,7 +77,7 @@ def ffn(x, mlp):  # [n_seq, n_embd] -> [n_seq, n_embd]
     return y
 
 
-def attention(q, k, v, mask, layer_index):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] -> [n_q, d_v]
+def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] -> [n_q, d_v]
     """
         mha:
             Q = q @ I
@@ -153,7 +153,7 @@ def mha(x, attn, n_head, layer_index):  # [n_seq, n_embd] -> [n_seq, n_embd]
     # 在每个头上执行attention
     out_heads = []
     for q, k, v in qkv_heads:
-        out = attention(q, k, v, causal_mask, layer_index)
+        out = attention(q, k, v, causal_mask)
         out_heads.append(out)  # n_head * [n_seq, n_embd/n_head]
 
     # 合并多头
@@ -214,15 +214,16 @@ def generate(inputs, params, n_head, n_tokens_to_generate):
     # 清空缓存
     kv_cache = {}
 
-    # 传入完整的prompt，填充缓存
-    logits = gpt2(inputs, params, n_head=n_head)
-    next_id = np.argmax(logits[-1])
-    inputs.append(int(next_id))
-
-    for _ in tqdm(range(n_tokens_to_generate - 1), "generating", total=n_tokens_to_generate):
-        logits = gpt2([next_id], params, n_head=n_head)  # 这里只传1个token
-        next_id = np.argmax(logits[-1])
-        inputs.append(int(next_id))
+    for step in tqdm(range(n_tokens_to_generate), "generating", total=n_tokens_to_generate):
+        if step == 0:
+            # 传入完整的prompt，填充缓存
+            logits = gpt2(inputs, params, n_head=n_head)
+            next_id = np.argmax(logits[-1])
+            inputs.append(int(next_id))
+        else :
+            logits = gpt2([next_id], params, n_head=n_head)  # 这里只传1个token
+            next_id = np.argmax(logits[-1])
+            inputs.append(int(next_id))
 
     return inputs[len(inputs) - n_tokens_to_generate:]
 
