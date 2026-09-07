@@ -9,6 +9,8 @@ GELU_PARA1 = math.sqrt(2.0 / math.pi)
 GELU_PARA2 = 0.044715
 
 kv_cache = {}
+kv_cache_draft = {}
+kv_cache_target = {}
 
 
 def gelu(x):
@@ -110,8 +112,12 @@ def attention(q, k, v, mask):  # [n_q, d_k], [n_k, d_k], [n_k, d_v], [n_q, n_k] 
     return O
 
 
-def mha(x, attn, n_head, layer_index):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def mha(x, attn, n_head, layer_index, use_cache=True, cache_dict=None):  # [n_seq, n_embd] -> [n_seq, n_embd]
     global kv_cache
+    if cache_dict is not None:
+        cache = cache_dict
+    else:
+        cache = kv_cache
 
     c_attn, c_proj = attn['c_attn'], attn['c_proj']
     # qkv projection
@@ -123,8 +129,8 @@ def mha(x, attn, n_head, layer_index):  # [n_seq, n_embd] -> [n_seq, n_embd]
     # 构造矩阵causal_mask
     n_seq = x.size(0)
     # 如果有缓存
-    if layer_index in kv_cache:
-        k_cache, v_cache = kv_cache[layer_index]
+    if use_cache and layer_index in cache:
+        k_cache, v_cache = cache[layer_index]
         n_new = k_cache.size(0) + n_seq
 
         causal_mask = torch.zeros(n_seq, n_new, dtype=torch.bool)  # [n_seq, n_new]
@@ -135,14 +141,15 @@ def mha(x, attn, n_head, layer_index):  # [n_seq, n_embd] -> [n_seq, n_embd]
         # 生成一个主对角线及以下为False，以上为True的三角矩阵
         causal_mask = torch.triu(torch.ones(n_seq, n_seq), diagonal=1).bool()
 
-    # 将新词拼接到kv
-    if layer_index in kv_cache:
-        k_cache, v_cache = kv_cache[layer_index]
-        k = torch.cat([k_cache, k], dim=0)  # [n_seq + 1, n_embd]
-        v = torch.cat([v_cache, v], dim=0)  # [n_seq + 1, n_embd]
+    if use_cache:
+        # 将新词拼接到kv
+        if layer_index in cache:
+            k_cache, v_cache = cache[layer_index]
+            k = torch.cat([k_cache, k], dim=0)  # [n_seq + 1, n_embd]
+            v = torch.cat([v_cache, v], dim=0)  # [n_seq + 1, n_embd]
 
-    # 更新kv_cache
-    kv_cache[layer_index] = (k, v)
+        # 更新kv_cache
+        cache[layer_index] = (k, v)
 
     # 拆头
     q_heads = q.chunk(n_head, dim=-1)
@@ -165,11 +172,13 @@ def mha(x, attn, n_head, layer_index):  # [n_seq, n_embd] -> [n_seq, n_embd]
     return x
 
 
-def transformer_block(x, block, n_head, layer_index):  # [n_seq, n_embd] -> [n_seq, n_embd]
+def transformer_block(x, block, n_head, layer_index, use_cache=True,
+                      cache_dict=None):  # [n_seq, n_embd] -> [n_seq, n_embd]
     mlp, attn, ln_1, ln_2 = block['mlp'], block['attn'], block['ln_1'], block['ln_2']
 
     # multi-head causal self attention
-    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head, layer_index=layer_index)  # [n_seq, n_embd] -> [n_seq, n_embd]
+    x = x + mha(layer_norm(x, ln_1), attn, n_head=n_head, layer_index=layer_index, use_cache=use_cache,
+                cache_dict=cache_dict)  # [n_seq, n_embd] -> [n_seq, n_embd]
 
     # position-wise feed forward network
     x = x + ffn(layer_norm(x, ln_2), mlp)  # [n_seq, n_embd] -> [n_seq, n_embd]
@@ -177,14 +186,18 @@ def transformer_block(x, block, n_head, layer_index):  # [n_seq, n_embd] -> [n_s
     return x
 
 
-def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
+def gpt2(inputs, params, n_head, use_cache=True, cache_dict=None):  # [n_seq] -> [n_seq, n_vocab]
     global kv_cache
+    if cache_dict is not None:
+        cache = cache_dict
+    else:
+        cache = kv_cache
     wte, wpe, blocks, ln_f = params['wte'], params['wpe'], params['blocks'], params['ln_f']
 
     # 计算位置编码
-    if kv_cache:
+    if use_cache and cache:
         # 如果有缓存，就从缓存长度开始
-        k_cache, v_cache = kv_cache[0]
+        k_cache, v_cache = cache[0]
         start_pos = k_cache.size(0)
     else:
         # 如果没有缓存，就从0开始
@@ -199,7 +212,8 @@ def gpt2(inputs, params, n_head):  # [n_seq] -> [n_seq, n_vocab]
     # forward pass through n_layer transformer blocks
     layer_index = 0
     for block in blocks:
-        x = transformer_block(x, block, n_head=n_head, layer_index=layer_index)  # [n_seq, n_embd] -> [n_seq, n_embd]
+        x = transformer_block(x, block, n_head=n_head, layer_index=layer_index, use_cache=use_cache,
+                              cache_dict=cache)  # [n_seq, n_embd] -> [n_seq, n_embd]
         layer_index += 1
 
     # projection to vocab
@@ -217,15 +231,24 @@ def generate(inputs, params, n_head, n_tokens_to_generate):
     for step in tqdm(range(n_tokens_to_generate), "generating", total=n_tokens_to_generate):
         if step == 0:
             # 传入完整的prompt，填充缓存
-            logits = gpt2(inputs, params, n_head=n_head)
+            logits = gpt2(inputs, params, n_head=n_head, use_cache=True)
             next_id = np.argmax(logits[-1])
             inputs.append(int(next_id))
-        else :
-            logits = gpt2([next_id], params, n_head=n_head)  # 这里只传1个token
+        else:
+            logits = gpt2([next_id], params, n_head=n_head, use_cache=True)  # 这里只传1个token
             next_id = np.argmax(logits[-1])
             inputs.append(int(next_id))
 
     return inputs[len(inputs) - n_tokens_to_generate:]
+
+
+def rollback_kv_cache(kv_cache_, target_length):
+    """
+        将kv_cache回滚到指定的序列长度
+    """
+    for layer_index in kv_cache:
+        k, v = kv_cache[layer_index]
+        kv_cache[layer_index] = (k[:target_length], v[:target_length])
 
 
 def greedy_speculative_generate(inputs, draft_params, target_params, hparams_draft, hparams_target,
@@ -244,36 +267,123 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
             list: A list of newly generated token IDs.
 
     """
+    # 初始化两个kv_cache
+    from tqdm import tqdm
+    import copy
+
+    global kv_cache_draft, kv_cache_target
+    kv_cache_draft = {}
+    kv_cache_target = {}
+
     generated_ids = []
     current_inputs = list(inputs)
 
-    while len(generated_ids) < n_tokens_to_generate:
-        pass
+    n_head_draft = hparams_draft["n_head"]
+    n_head_target = hparams_target["n_head"]
 
+    pbar = tqdm(total=n_tokens_to_generate, desc="Generating", position=0, leave=True)
+    while len(generated_ids) < n_tokens_to_generate:
+
+        # 小模型生成K个草稿token
+        draft_tokens = []
+        draft_probs = []  # 小模型对每个草稿token的概率
+        seq_len_before = len(current_inputs)
+        for i in range(K):
+            logits = gpt2(current_inputs, draft_params, n_head_draft, use_cache=True, cache_dict=kv_cache_draft)
+            next_id = np.argmax(logits[-1])
+
+            # 计算小模型对这个token的概率
+            probs = softmax(torch.tensor(logits[-1]), dim=-1)
+            draft_probs.append(probs[next_id].item())
+            draft_tokens.append(next_id)
+            current_inputs.append(next_id)
+
+        # 大模型验证草稿序列
+        target_logits = gpt2(current_inputs, target_params, n_head_target, use_cache=False)
+
+        accept_count = 0
+        for i in range(K):
+            # 计算大模型对第i个草稿token的概率
+            target_logit = target_logits[seq_len_before + i]
+            target_probs = softmax(target_logit, dim=-1)
+            target_prob = target_probs[draft_tokens[i]].item()
+
+            # 小模型对第i个草稿token的概率
+            draft_porb = draft_probs[i]
+
+            # 如果大模型的概率>=小模型的概率，接受
+            if target_prob >= draft_porb:
+                accept_count += 1
+            else:
+                # 大模型直接生成正确的token
+                correct_id = np.argmax(target_logit)
+
+                # 回滚小模型的kv_cache
+                current_inputs = current_inputs[:seq_len_before + i]
+                rollback_kv_cache(kv_cache_draft, len(current_inputs))
+
+                # 把大模型生成的正确token加入序列
+                current_inputs.append(correct_id)
+                generated_ids.append(correct_id)
+                pbar.update(1)
+
+                break
+
+        # 如果全部接受
+        if accept_count == K:
+            generated_ids.extend(draft_tokens)
+            pbar.update(K)
+
+        # 如果生成的token数量达到要求了，结束循环
+        if len(generated_ids) >= n_tokens_to_generate:
+            break
+
+    pbar.close()
     return generated_ids
 
 
-def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", models_dir: str = "models"):
+def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", models_dir: str = "models",
+         use_speculative: bool = False, K: int = 4):
     from utils import load_encoder_hparams_and_params
 
-    # load encoder, hparams, and params from the released open-ai gpt-2 files
-    encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
+    if use_speculative:
+        encoder, hparams_draft, draft_params = load_encoder_hparams_and_params("124M", models_dir)
+        _, hparams_target, target_params = load_encoder_hparams_and_params("1558M", models_dir)
 
-    # encode the input string using the BPE tokenizer
-    input_ids = encoder.encode(prompt)
+        input_ids = encoder.encode(prompt)
+        assert len(input_ids) + n_tokens_to_generate < hparams_target["n_ctx"]
+        start = time.time()
+        output_ids = greedy_speculative_generate(
+            input_ids, draft_params, target_params,
+            hparams_draft, hparams_target,
+            n_tokens_to_generate, K
+        )
+        end = time.time()
+        print(f"Time taken to generate {n_tokens_to_generate} tokens (speculative): {end - start:.2f}s")
 
-    # make sure we are not surpassing the max sequence length of our model
-    assert len(input_ids) + n_tokens_to_generate < hparams["n_ctx"]
+        # 解码输出
+        output_text = encoder.decode(output_ids)
+        return output_text
 
-    # generate output ids
-    start = time.time()
-    output_ids = generate(input_ids, params, hparams["n_head"], n_tokens_to_generate)
-    end = time.time()
-    print(f"Time taken to generate {n_tokens_to_generate} tokens: {end - start:.2f}s")
+    else :
+        # load encoder, hparams, and params from the released open-ai gpt-2 files
+        encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
 
-    # decode the ids back into a string
-    output_text = encoder.decode(output_ids)
-    return output_text
+        # encode the input string using the BPE tokenizer
+        input_ids = encoder.encode(prompt)
+
+        # make sure we are not surpassing the max sequence length of our model
+        assert len(input_ids) + n_tokens_to_generate < hparams["n_ctx"]
+
+        # generate output ids
+        start = time.time()
+        output_ids = generate(input_ids, params, hparams["n_head"], n_tokens_to_generate)
+        end = time.time()
+        print(f"Time taken to generate {n_tokens_to_generate} tokens: {end - start:.2f}s")
+
+        # decode the ids back into a string
+        output_text = encoder.decode(output_ids)
+        return output_text
 
 
 if __name__ == "__main__":
