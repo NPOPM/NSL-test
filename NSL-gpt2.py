@@ -246,34 +246,14 @@ def rollback_kv_cache(kv_cache_, target_length):
     """
         将kv_cache回滚到指定的序列长度
     """
-    for layer_index in kv_cache:
-        k, v = kv_cache[layer_index]
-        kv_cache[layer_index] = (k[:target_length], v[:target_length])
+    for layer_index in kv_cache_:
+        k, v = kv_cache_[layer_index]
+        kv_cache_[layer_index] = (k[:target_length], v[:target_length])
 
 
 def greedy_speculative_generate(inputs, draft_params, target_params, hparams_draft, hparams_target,
                                 n_tokens_to_generate, K):
-    """
-        Task: Load 124M and 1558M models at the same time, use greedy sampling, and complete speculative decoding
-
-        Inputs:
-            inputs (list): The initial list of token IDs from the prompt.
-            draft_params, target_params: Model weights for the draft and target models.
-            hparams_draft, hparams_target: Hyperparameters for both models.
-            n_tokens_to_generate (int): The number of new tokens to generate.
-            K (int): The number of tokens the draft model speculates at each step (e.g., 4).
-
-        Returns:
-            list: A list of newly generated token IDs.
-
-    """
-    # 初始化两个kv_cache
     from tqdm import tqdm
-    import copy
-
-    global kv_cache_draft, kv_cache_target
-    kv_cache_draft = {}
-    kv_cache_target = {}
 
     generated_ids = []
     current_inputs = list(inputs)
@@ -281,65 +261,40 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
     n_head_draft = hparams_draft["n_head"]
     n_head_target = hparams_target["n_head"]
 
-    pbar = tqdm(total=n_tokens_to_generate, desc="Generating", position=0, leave=True)
+    pbar = tqdm(n_tokens_to_generate, "Generating", 0, True)
+
     while len(generated_ids) < n_tokens_to_generate:
-
-        # 小模型生成K个草稿token
-        draft_tokens = []
-        draft_probs = []  # 小模型对每个草稿token的概率
         seq_len_before = len(current_inputs)
-        for i in range(K):
-            logits = gpt2(current_inputs, draft_params, n_head_draft, use_cache=True, cache_dict=kv_cache_draft)
-            next_id = np.argmax(logits[-1])
 
-            # 计算小模型对这个token的概率
-            probs = softmax(torch.tensor(logits[-1]), dim=-1)
-            draft_probs.append(probs[next_id].item())
+        # 小模型生成K个草稿
+        draft_tokens = []
+        draft_inputs = list(current_inputs)
+        for i in range(K):
+            logits = gpt2(draft_inputs, draft_params, n_head_draft, use_cache=False)
+            next_id = int(np.argmax(logits[-1]))
             draft_tokens.append(next_id)
-            current_inputs.append(next_id)
+            draft_inputs.append(next_id)
 
-        # 大模型验证草稿序列
-        target_logits = gpt2(current_inputs, target_params, n_head_target, use_cache=False)
+        # 大模型验证
+        full_inputs = current_inputs + draft_tokens
+        target_logits = gpt2(full_inputs, target_params, n_head_target, use_cache=False)
 
-        accept_count = 0
         for i in range(K):
-            # 计算大模型对第i个草稿token的概率
-            target_logit = target_logits[seq_len_before + i]
-            target_probs = softmax(target_logit, dim=-1)
-            target_prob = target_probs[draft_tokens[i]].item()
+            target_logit = target_logits[seq_len_before + i - 1]
+            target_token = int(np.argmax(target_logit))
 
-            # 小模型对第i个草稿token的概率
-            draft_porb = draft_probs[i]
-
-            # 如果大模型的概率>=小模型的概率，接受
-            if target_prob >= draft_porb:
-                accept_count += 1
-            else:
-                # 大模型直接生成正确的token
-                correct_id = np.argmax(target_logit)
-
-                # 回滚小模型的kv_cache
-                current_inputs = current_inputs[:seq_len_before + i]
-                rollback_kv_cache(kv_cache_draft, len(current_inputs))
-
-                # 把大模型生成的正确token加入序列
-                current_inputs.append(correct_id)
-                generated_ids.append(correct_id)
+            if draft_tokens[i] == target_token:
+                current_inputs.append(draft_tokens[i])
+                generated_ids.append(draft_tokens[i])
                 pbar.update(1)
-
+            else:
+                current_inputs.append(target_token)
+                generated_ids.append(target_token)
+                pbar.update(1)
                 break
 
-        # 如果全部接受
-        if accept_count == K:
-            generated_ids.extend(draft_tokens)
-            pbar.update(K)
-
-        # 如果生成的token数量达到要求了，结束循环
-        if len(generated_ids) >= n_tokens_to_generate:
-            break
-
     pbar.close()
-    return generated_ids
+    return generated_ids[:n_tokens_to_generate]
 
 
 def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", models_dir: str = "models",
@@ -384,6 +339,8 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
         # decode the ids back into a string
         output_text = encoder.decode(output_ids)
         return output_text
+
+
 
 
 if __name__ == "__main__":
