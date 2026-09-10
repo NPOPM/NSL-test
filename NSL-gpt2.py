@@ -188,6 +188,7 @@ def transformer_block(x, block, n_head, layer_index, use_cache=True,
 
 def gpt2(inputs, params, n_head, use_cache=True, cache_dict=None):  # [n_seq] -> [n_seq, n_vocab]
     global kv_cache
+
     if cache_dict is not None:
         cache = cache_dict
     else:
@@ -254,6 +255,9 @@ def rollback_kv_cache(kv_cache_, target_length):
 def greedy_speculative_generate(inputs, draft_params, target_params, hparams_draft, hparams_target,
                                 n_tokens_to_generate, K):
     from tqdm import tqdm
+    global kv_cache_draft, kv_cache_target
+    kv_cache_draft = {}
+    kv_cache_target = {}
 
     generated_ids = []
     current_inputs = list(inputs)
@@ -261,7 +265,7 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
     n_head_draft = hparams_draft["n_head"]
     n_head_target = hparams_target["n_head"]
 
-    pbar = tqdm(n_tokens_to_generate, "Generating", 0, True)
+    pbar = tqdm(total=n_tokens_to_generate, desc="Generating", position=0, leave=True)
 
     while len(generated_ids) < n_tokens_to_generate:
         seq_len_before = len(current_inputs)
@@ -270,7 +274,13 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
         draft_tokens = []
         draft_inputs = list(current_inputs)
         for i in range(K):
-            logits = gpt2(draft_inputs, draft_params, n_head_draft, use_cache=False)
+
+            if kv_cache_draft:
+                input_ = [draft_inputs[-1]]
+            else:
+                input_ = current_inputs
+
+            logits = gpt2(input_, draft_params, n_head_draft, use_cache=True, cache_dict=kv_cache_draft)
             next_id = int(np.argmax(logits[-1]))
             draft_tokens.append(next_id)
             draft_inputs.append(next_id)
@@ -289,8 +299,10 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
                 pbar.update(1)
             else:
                 current_inputs.append(target_token)
+                rollback_kv_cache(kv_cache_draft, len(current_inputs))
                 generated_ids.append(target_token)
                 pbar.update(1)
+                gpt2([target_token], draft_params, n_head_draft, use_cache=True, cache_dict=kv_cache_draft)
                 break
 
     pbar.close()
