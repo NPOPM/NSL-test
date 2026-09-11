@@ -267,6 +267,8 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
 
     pbar = tqdm(total=n_tokens_to_generate, desc="Generating", position=0, leave=True)
 
+    last_target_logits = gpt2(current_inputs, target_params, n_head_target,use_cache=True, cache_dict=kv_cache_target)
+    last_target_logit = last_target_logits[-1] # 下一个token的logits
     while len(generated_ids) < n_tokens_to_generate:
         seq_len_before = len(current_inputs)
 
@@ -286,24 +288,42 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
             draft_inputs.append(next_id)
 
         # 大模型验证
-        full_inputs = current_inputs + draft_tokens
-        target_logits = gpt2(full_inputs, target_params, n_head_target, use_cache=False)
+        target_logits = gpt2(draft_tokens, target_params, n_head_target, use_cache=True, cache_dict=kv_cache_target)
+        verify_logits = [last_target_logit] + [target_logits[i] for i in range(K - 1)]
 
+        accept_count = 0
         for i in range(K):
-            target_logit = target_logits[seq_len_before + i - 1]
-            target_token = int(np.argmax(target_logit))
+            target_token = int(np.argmax(verify_logits[i]))
 
             if draft_tokens[i] == target_token:
                 current_inputs.append(draft_tokens[i])
                 generated_ids.append(draft_tokens[i])
+                accept_count += 1
+
                 pbar.update(1)
+                #如果生成够了，就停止
+                if len(generated_ids) >= n_tokens_to_generate:
+                    break
+
             else:
                 current_inputs.append(target_token)
-                rollback_kv_cache(kv_cache_draft, len(current_inputs))
                 generated_ids.append(target_token)
-                pbar.update(1)
+
+                rollback_kv_cache(kv_cache_draft, seq_len_before+accept_count)
+                rollback_kv_cache(kv_cache_target, seq_len_before+accept_count)
+
                 gpt2([target_token], draft_params, n_head_draft, use_cache=True, cache_dict=kv_cache_draft)
+                #这里要记录最后一个生成出的token
+                last_target_logits = gpt2([target_token], target_params, n_head_target, use_cache=True,
+                                          cache_dict=kv_cache_target)
+                last_target_logit = last_target_logits[-1]
+
+                pbar.update(1)
                 break
+
+        else:
+            #如果都接受了，target_logits的最后一行就是大模型预测的下一个token
+            last_target_logit = target_logits[-1]
 
     pbar.close()
     return generated_ids[:n_tokens_to_generate]
@@ -332,7 +352,7 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
         output_text = encoder.decode(output_ids)
         return output_text
 
-    else :
+    else:
         # load encoder, hparams, and params from the released open-ai gpt-2 files
         encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
 
@@ -351,8 +371,6 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
         # decode the ids back into a string
         output_text = encoder.decode(output_ids)
         return output_text
-
-
 
 
 if __name__ == "__main__":
