@@ -4,6 +4,7 @@ import time
 import math
 
 torch.set_printoptions(8)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 GELU_PARA1 = math.sqrt(2.0 / math.pi)
 GELU_PARA2 = 0.044715
@@ -44,7 +45,7 @@ def layer_norm(x, g_b, eps: float = 1e-5):
     """
 
     # 从g_b字典中取出缩放系数g(gamma)和偏置量b(bias)
-    g, b = torch.Tensor(g_b['g']), torch.Tensor(g_b['b'])
+    g, b = g_b['g'], g_b['b']
 
     # 计算均值和方差
     # unbiased=False表示计算方差时除以n，而不是n-1，这样得到的是“总体方差”
@@ -127,19 +128,21 @@ def mha(x, attn, n_head, layer_index, use_cache=True, cache_dict=None):  # [n_se
     q, k, v = torch.chunk(x, 3, dim=-1)  # [n_seq, n_embd]
 
     # 构造矩阵causal_mask
+    device = q.device
     n_seq = x.size(0)
     # 如果有缓存
     if use_cache and layer_index in cache:
         k_cache, v_cache = cache[layer_index]
         n_new = k_cache.size(0) + n_seq
 
-        causal_mask = torch.zeros(n_seq, n_new, dtype=torch.bool)  # [n_seq, n_new]
+        causal_mask = torch.zeros(n_seq, n_new, dtype=torch.bool, device=device)  # [n_seq, n_new]
         for i in range(n_seq):
             causal_mask[i, k_cache.size(0) + i + 1:] = True
     # 如果没有缓存
     else:
         # 生成一个主对角线及以下为False，以上为True的三角矩阵
-        causal_mask = torch.triu(torch.ones(n_seq, n_seq), diagonal=1).bool()
+        causal_mask = torch.triu(
+            torch.ones(n_seq, n_seq, dtype=torch.bool, device=device), diagonal=1)
 
     if use_cache:
         # 将新词拼接到kv
@@ -186,6 +189,7 @@ def transformer_block(x, block, n_head, layer_index, use_cache=True,
     return x
 
 
+@torch.no_grad()
 def gpt2(inputs, params, n_head, use_cache=True, cache_dict=None):  # [n_seq] -> [n_seq, n_vocab]
     global kv_cache
 
@@ -208,7 +212,6 @@ def gpt2(inputs, params, n_head, use_cache=True, cache_dict=None):  # [n_seq] ->
 
     # token + positional embeddings
     x = wte[inputs] + wpe[positions]  # [n_seq] -> [n_seq, n_embd]
-    x = torch.Tensor(x)
 
     # forward pass through n_layer transformer blocks
     layer_index = 0
@@ -233,11 +236,11 @@ def generate(inputs, params, n_head, n_tokens_to_generate):
         if step == 0:
             # 传入完整的prompt，填充缓存
             logits = gpt2(inputs, params, n_head=n_head, use_cache=True)
-            next_id = np.argmax(logits[-1])
+            next_id = torch.argmax(logits[-1]).item()
             inputs.append(int(next_id))
         else:
             logits = gpt2([next_id], params, n_head=n_head, use_cache=True)  # 这里只传1个token
-            next_id = np.argmax(logits[-1])
+            next_id = torch.argmax(logits[-1]).item()
             inputs.append(int(next_id))
 
     return inputs[len(inputs) - n_tokens_to_generate:]
@@ -267,66 +270,109 @@ def greedy_speculative_generate(inputs, draft_params, target_params, hparams_dra
 
     pbar = tqdm(total=n_tokens_to_generate, desc="Generating", position=0, leave=True)
 
-    last_target_logits = gpt2(current_inputs, target_params, n_head_target,use_cache=True, cache_dict=kv_cache_target)
-    last_target_logit = last_target_logits[-1] # 下一个token的logits
+    total_steps = 0
+    total_draft = 0
+    total_accepted = 0
+    total_rejected = 0
+
+    last_target_logits = gpt2(current_inputs, target_params, n_head_target,
+                              use_cache=True, cache_dict=kv_cache_target)
+    last_target_logit = last_target_logits[-1]
+
     while len(generated_ids) < n_tokens_to_generate:
+        total_steps += 1
         seq_len_before = len(current_inputs)
 
-        # 小模型生成K个草稿
+        # 小模型生成草稿
         draft_tokens = []
         draft_inputs = list(current_inputs)
         for i in range(K):
-
             if kv_cache_draft:
                 input_ = [draft_inputs[-1]]
             else:
                 input_ = current_inputs
 
-            logits = gpt2(input_, draft_params, n_head_draft, use_cache=True, cache_dict=kv_cache_draft)
-            next_id = int(np.argmax(logits[-1]))
+            logits = gpt2(input_, draft_params, n_head_draft,
+                          use_cache=True, cache_dict=kv_cache_draft)
+            next_id = torch.argmax(logits[-1]).item()
             draft_tokens.append(next_id)
             draft_inputs.append(next_id)
 
         # 大模型验证
-        target_logits = gpt2(draft_tokens, target_params, n_head_target, use_cache=True, cache_dict=kv_cache_target)
+        target_logits = gpt2(draft_tokens, target_params, n_head_target,
+                             use_cache=True, cache_dict=kv_cache_target)
         verify_logits = [last_target_logit] + [target_logits[i] for i in range(K - 1)]
+        target_tokens = [torch.argmax(verify_logits[i]).item() for i in range(K)]
 
         accept_count = 0
+        accept_marks = []
         for i in range(K):
-            target_token = int(np.argmax(verify_logits[i]))
-
-            if draft_tokens[i] == target_token:
+            total_draft += 1
+            if draft_tokens[i] == target_tokens[i]:
+                accept_marks.append("✓")
+                total_accepted += 1
                 current_inputs.append(draft_tokens[i])
                 generated_ids.append(draft_tokens[i])
                 accept_count += 1
-
                 pbar.update(1)
-                #如果生成够了，就停止
                 if len(generated_ids) >= n_tokens_to_generate:
                     break
-
             else:
-                current_inputs.append(target_token)
-                generated_ids.append(target_token)
+                accept_marks.append("×")
+                total_rejected += 1
+                current_inputs.append(target_tokens[i])
+                generated_ids.append(target_tokens[i])
 
-                rollback_kv_cache(kv_cache_draft, seq_len_before+accept_count)
-                rollback_kv_cache(kv_cache_target, seq_len_before+accept_count)
+                rollback_kv_cache(kv_cache_draft, seq_len_before + accept_count)
+                rollback_kv_cache(kv_cache_target, seq_len_before + accept_count)
 
-                gpt2([target_token], draft_params, n_head_draft, use_cache=True, cache_dict=kv_cache_draft)
-                #这里要记录最后一个生成出的token
-                last_target_logits = gpt2([target_token], target_params, n_head_target, use_cache=True,
-                                          cache_dict=kv_cache_target)
+                last_target_logits = gpt2([target_tokens[i]], target_params, n_head_target,
+                                          use_cache=True, cache_dict=kv_cache_target)
                 last_target_logit = last_target_logits[-1]
 
                 pbar.update(1)
                 break
-
         else:
-            #如果都接受了，target_logits的最后一行就是大模型预测的下一个token
             last_target_logit = target_logits[-1]
 
+        run_acc = total_accepted / total_draft * 100 if total_draft > 0 else 0.0
+        mark_str = " ".join(f"{tok}({m})" for tok, m in zip(draft_tokens, accept_marks))
+        tqdm.write(
+            f"[Step {total_steps:>3}] "
+            f"Draft : {draft_tokens}\n"
+            f"             Target: {target_tokens}\n"
+            f"             Result: {mark_str}   "
+            f"| accept {accept_count}/{K}  "
+            f"| 累计接受率 {run_acc:.1f}%"
+        )
+
     pbar.close()
+
+    print("\n" + "=" * 60)
+    print("          投机解码接受率统计")
+    print("=" * 60)
+    print(f"  总步数           : {total_steps}")
+    print(f"  总草稿 token 数  : {total_draft}")
+    print(f"  接受 token 数    : {total_accepted}")
+    print(f"  拒绝 token 数    : {total_rejected}")
+    if total_draft > 0:
+        print(f"  整体接受率       : {total_accepted / total_draft * 100:.2f}%")
+    print("=" * 60)
+
     return generated_ids[:n_tokens_to_generate]
+
+
+def to_device(obj):
+    if isinstance(obj, dict):
+        return {k: to_device(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(to_device(v) for v in obj)
+    elif isinstance(obj, np.ndarray):
+        return torch.tensor(obj, device=device)
+    elif torch.is_tensor(obj):
+        return obj.to(device)
+    else:
+        return obj
 
 
 def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", models_dir: str = "models",
@@ -334,8 +380,11 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
     from utils import load_encoder_hparams_and_params
 
     if use_speculative:
-        encoder, hparams_draft, draft_params = load_encoder_hparams_and_params("124M", models_dir)
+        encoder, hparams_draft, draft_params = load_encoder_hparams_and_params("774M", models_dir)
         _, hparams_target, target_params = load_encoder_hparams_and_params("1558M", models_dir)
+
+        draft_params = to_device(draft_params)
+        target_params = to_device(target_params)
 
         input_ids = encoder.encode(prompt)
         assert len(input_ids) + n_tokens_to_generate < hparams_target["n_ctx"]
@@ -355,6 +404,8 @@ def main(prompt: str, n_tokens_to_generate: int = 5, model_size: str = "124M", m
     else:
         # load encoder, hparams, and params from the released open-ai gpt-2 files
         encoder, hparams, params = load_encoder_hparams_and_params(model_size, models_dir)
+
+        params = to_device(params)
 
         # encode the input string using the BPE tokenizer
         input_ids = encoder.encode(prompt)
